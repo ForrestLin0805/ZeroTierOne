@@ -1,0 +1,109 @@
+name: Build ZeroTier 1.16.2 x64 tcpq4m
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Checkout official ZeroTier 1.16.2
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf true
+          git fetch --depth=1 https://github.com/zerotier/ZeroTierOne.git refs/tags/1.16.2
+          git checkout --detach FETCH_HEAD
+
+          Write-Host "Building commit:"
+          git rev-parse HEAD
+          git describe --tags --always
+
+      - name: Patch TCP fallback queue from 64 KiB to 4 MiB
+        shell: pwsh
+        run: |
+          $path = "service/OneService.cpp"
+
+          $old = 'if (_tcpFallbackTunnel->writeq.size() < (1024 * 64)) {'
+          $new = 'if (_tcpFallbackTunnel->writeq.size() < (1024 * 1024 * 4)) {'
+
+          $text = [System.IO.File]::ReadAllText($path)
+
+          $count = ([regex]::Matches(
+              $text,
+              [regex]::Escape($old)
+          )).Count
+
+          Write-Host "Original line matches: $count"
+
+          if ($count -ne 1) {
+              throw "Expected exactly one 64 KiB TCP fallback queue line, found $count"
+          }
+
+          $text = $text.Replace($old, $new)
+
+          [System.IO.File]::WriteAllText(
+              $path,
+              $text,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          Write-Host "Patch applied:"
+          git diff -- service/OneService.cpp
+
+          if (-not (Select-String -Path $path -SimpleMatch '(1024 * 1024 * 4)')) {
+              throw "4 MiB patch verification failed"
+          }
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build ZeroTier x64 Release
+        shell: pwsh
+        run: |
+          msbuild windows\ZeroTierOne.sln `
+            /m `
+            /p:Configuration=Release `
+            /property:Platform=x64 `
+            /t:ZeroTierOne
+
+      - name: Verify output and calculate SHA256
+        shell: pwsh
+        run: |
+          $exe = "windows\Build\x64\Release\zerotier-one_x64.exe"
+
+          if (-not (Test-Path $exe)) {
+              throw "zerotier-one_x64.exe was not generated"
+          }
+
+          Get-Item $exe | Format-List FullName,Length,LastWriteTime
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+
+          Write-Host "SHA256: $hash"
+
+          "$hash  zerotier-one_x64.exe" |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+
+      - name: Upload patched ZeroTier executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerotier-one_x64-1.16.2-tcpq4m
+          path: |
+            windows/Build/x64/Release/zerotier-one_x64.exe
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
